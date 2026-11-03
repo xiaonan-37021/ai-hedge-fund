@@ -8,6 +8,7 @@ import yaml
 from pydantic import ValidationError
 
 from hedge_fund.fund import (
+    AllocationPolicy,
     custom_strategy,
     discover_funds,
     format_interval,
@@ -370,3 +371,41 @@ def test_save_spec_round_trips_and_never_overwrites(tmp_path):
     with pytest.raises(FileExistsError):
         save_spec(spec, tmp_path / "mandates")
     assert load_spec(path) == spec
+
+
+def test_allocation_policy_multiplier_by_hand():
+    policy = AllocationPolicy()
+    assert (policy.min_evidence, policy.slope, policy.floor, policy.cap) == (20, 0.25, 0.25, 2.0)
+    assert policy.multiplier(2.0, 20) == pytest.approx(1.5)
+    assert policy.multiplier(-2.0, 20) == pytest.approx(0.5)
+    assert policy.multiplier(-4.0, 20) == 0.25      # the floor
+    assert policy.multiplier(8.0, 20) == 2.0        # the cap
+    assert policy.multiplier(2.0, 19) == 1.0        # not enough evidence
+    assert policy.multiplier(None, 50) == 1.0       # nothing graded
+    for bad in ({"min_evidence": 1}, {"slope": -0.1}, {"floor": 0}, {"floor": 1.5}, {"cap": 0.9}, {"tilt": 1}):
+        with pytest.raises(ValidationError):
+            AllocationPolicy(**bad)
+
+
+def test_allocation_is_absent_unless_the_mandate_names_it():
+    # A mandate without the allocator serializes exactly as it did before one existed.
+    assert "allocation" not in FundSpec(**MINIMAL).model_dump()
+    on = FundSpec(**{**MINIMAL, "allocation": {}})
+    assert on.allocation == AllocationPolicy()
+    assert on.model_dump()["allocation"] == {"min_evidence": 20, "slope": 0.25, "floor": 0.25, "cap": 2.0}
+    assert FundSpec.model_validate_json(on.model_dump_json()) == on
+
+
+def test_the_halving_tier_and_factor_caps_serialize_only_when_set():
+    spec = FundSpec(**MINIMAL)
+    assert not spec.risk.has_factor_limits
+    assert set(spec.model_dump()["risk"]) == {"max_position_pct", "max_gross_exposure"}
+    full = FundSpec(**{**MINIMAL, "risk": {**MINIMAL["risk"], "halve_drawdown_pct": 0.1, "max_drawdown_pct": 0.2,
+                                            "max_beta": 0.5, "max_sector_pct": 0.3, "max_volatility": 0.15}})
+    assert full.risk.has_factor_limits
+    assert FundSpec.model_validate_json(full.model_dump_json()) == full
+    with pytest.raises(ValidationError, match="halve_drawdown_pct must be below max_drawdown_pct"):
+        FundSpec(**{**MINIMAL, "risk": {**MINIMAL["risk"], "halve_drawdown_pct": 0.2, "max_drawdown_pct": 0.2}})
+    for bad in ({"max_beta": 0}, {"max_sector_pct": 1.5}, {"max_volatility": -0.1}, {"halve_drawdown_pct": 1.0}):
+        with pytest.raises(ValidationError):
+            FundSpec(**{**MINIMAL, "risk": {**MINIMAL["risk"], **bad}})
